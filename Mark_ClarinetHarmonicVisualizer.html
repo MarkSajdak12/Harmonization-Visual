@@ -1,0 +1,1350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clarinet Harmonic Visualizer</title>
+<!--
+  Clarinet Harmonic Visualizer
+  ----------------------------
+  Single-file, dependency-free real-time analyzer for clarinet tone.
+  Web Audio API (getUserMedia + AnalyserNode) + Canvas 2D + vanilla JS.
+
+  Pitch detection: YIN (de Cheveigné & Kawahara, 2002), time domain.
+  Chosen over FFT peak-picking because in the clarion register the
+  fundamental is often weaker than the 3rd harmonic, so "loudest FFT bin"
+  would report a note a twelfth too high. YIN looks for the signal's
+  period instead of its loudest partial, so a weak fundamental is fine.
+  See the yin() function for the step-by-step algorithm.
+
+  Keyboard: F = freeze, P = PNG snapshot.
+-->
+<style>
+  :root {
+    --bg: #0b0d10; --panel: #12161b; --panel2: #171c22; --line: #232a32;
+    --text: #e6edf3; --muted: #8b98a5; --dim: #5c6873;
+    --odd: #ff8a3d; --even: #3db8ff; --accent: #9ef0c8; --warn: #ffd166; --bad: #ff5d6c;
+    --formant: #c08cff;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body { font-size: 13px; line-height: 1.4; }
+
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 16px; border-bottom: 1px solid var(--line); background: #0e1115;
+    position: sticky; top: 0; z-index: 10;
+  }
+  h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .02em; }
+  h1 small { color: var(--muted); font-weight: 400; margin-left: 8px; font-size: 12px; }
+  .spacer { flex: 1; }
+  .status { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; margin-right: 6px; }
+  .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--dim); margin-right: 6px; vertical-align: 0; }
+  .status.live .dot { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+
+  button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 7px 12px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: #3a4652; }
+  button:focus-visible { outline: 2px solid #7fd3ff; outline-offset: 1px; }
+  button.primary { background: #15382a; border-color: #2b6b4f; color: #c9f7e2; }
+  button.primary.live, button.live { background: #3a1519; border-color: #7a2b33; color: #ffd5d9; }
+  button.on { background: #2a2410; border-color: #7a6420; color: var(--warn); }
+
+  .controls {
+    display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center;
+    padding: 9px 16px; border-bottom: 1px solid var(--line); background: #0d1014;
+  }
+  .ctl { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+  .ctl output { color: var(--text); font-variant-numeric: tabular-nums; min-width: 54px; }
+  input[type=range] { width: 110px; accent-color: #7fd3ff; }
+  select, input[type=number] {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 5px; padding: 4px 6px; font: inherit;
+  }
+  input[type=number] { width: 64px; }
+  label.chk { display: flex; align-items: center; gap: 5px; color: var(--muted); cursor: pointer; }
+  input[type=checkbox] { accent-color: #7fd3ff; }
+
+  #banner {
+    display: none; margin: 12px 16px 0; padding: 10px 14px; border-radius: 8px;
+    border: 1px solid #7a2b33; background: #2a1215; color: #ffd5d9;
+    align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  #banner.show { display: flex; }
+  #banner p { margin: 0; flex: 1; min-width: 240px; }
+  #banner code { background: #00000055; padding: 1px 5px; border-radius: 4px; }
+
+  main { padding: 12px 16px 28px; }
+  .dash {
+    display: grid; gap: 12px;
+    grid-template-columns: minmax(270px, 330px) 1fr 1fr;
+    grid-template-areas:
+      "pitch harm  harm"
+      "pitch spec  spec"
+      "reg   reg   reg"
+      "oe    sgram sgram"
+      "cent  sgram sgram";
+  }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 12px; min-width: 0; display: flex; flex-direction: column;
+  }
+  .panel h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .09em; color: var(--muted);
+    margin: 0 0 8px; font-weight: 600; display: flex; align-items: center; gap: 8px;
+  }
+  .panel canvas { display: block; width: 100%; }
+  .leg { text-transform: none; letter-spacing: 0; font-weight: 500; display: inline-flex; align-items: center; gap: 4px; }
+  .leg::before { content: ""; width: 9px; height: 9px; border-radius: 2px; background: currentColor; }
+  .leg.odd { color: var(--odd); } .leg.even { color: var(--even); } .leg.formant { color: var(--formant); }
+  .h2spacer { flex: 1; }
+
+  #p-pitch { grid-area: pitch; }  #p-harm { grid-area: harm; }  #p-spec { grid-area: spec; }
+  #p-reg { grid-area: reg; }      #p-oe { grid-area: oe; }      #p-cent { grid-area: cent; }
+  #p-sgram { grid-area: sgram; }
+  #c-harm { height: 250px; } #c-spec { height: 250px; } #c-reg { height: 92px; }
+  #c-oe { height: 160px; }   #c-cent { height: 128px; } #c-sgram { height: 340px; }
+  #c-cents { height: 50px; margin: 8px 0 10px; }
+
+  /* Info tooltips */
+  .info {
+    position: relative; display: inline-grid; place-items: center; width: 16px; height: 16px;
+    border-radius: 50%; border: 1px solid var(--dim); color: var(--muted); font-size: 10px;
+    text-transform: none; letter-spacing: 0; cursor: help; font-style: italic; font-family: Georgia, serif;
+  }
+  .info:hover::after, .info:focus::after {
+    content: attr(data-tip); position: absolute; left: -6px; top: 22px; width: 300px;
+    padding: 9px 11px; background: #1c232b; border: 1px solid #33404c; border-radius: 6px;
+    color: var(--text); font: 400 12px/1.5 ui-sans-serif, system-ui, sans-serif; font-style: normal;
+    z-index: 30; white-space: normal; box-shadow: 0 10px 28px rgba(0,0,0,.55);
+  }
+
+  /* Pitch card */
+  .noteRow { display: flex; align-items: baseline; gap: 4px; min-height: 76px; }
+  .noteName { font-size: 64px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+  .noteOct { font-size: 26px; color: var(--muted); font-weight: 500; }
+  .badge {
+    margin-left: auto; align-self: center; font-size: 11px; font-weight: 600; letter-spacing: .04em;
+    padding: 4px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim);
+    transition: color .25s, border-color .25s, background-color .25s, box-shadow .25s;
+  }
+  .badge.on { color: #1a1206; background: var(--warn); border-color: var(--warn); box-shadow: 0 0 12px #ffd16655; }
+  .sub { color: var(--muted); font-size: 12px; }
+  dl.kv { display: grid; grid-template-columns: auto 1fr; gap: 5px 14px; margin: 0; font-variant-numeric: tabular-nums; }
+  dl.kv dt { color: var(--muted); }
+  dl.kv dd { margin: 0; text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  .levelWrap { margin-top: auto; padding-top: 12px; }
+  .levelLbl { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-bottom: 4px; font-variant-numeric: tabular-nums; }
+  .level { position: relative; height: 8px; background: #0b0e12; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+  .levelBar { position: absolute; inset: 0; transform-origin: left center; transform: scaleX(0); background: #3a4652; will-change: transform; }
+  .levelBar.open { background: linear-gradient(90deg, #2b6b4f, var(--accent)); }
+  .gateMark { position: absolute; top: -1px; bottom: -1px; width: 2px; background: var(--warn); }
+
+  /* Physics side panel */
+  aside#side {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(440px, 92vw); z-index: 40;
+    background: #10141a; border-left: 1px solid var(--line); box-shadow: -16px 0 40px rgba(0,0,0,.5);
+    transform: translateX(105%); transition: transform .25s ease; overflow-y: auto; padding: 18px 20px 40px;
+  }
+  aside#side.open { transform: translateX(0); }
+  aside h3 { font-size: 13px; margin: 20px 0 6px; color: var(--text); }
+  aside h3:first-of-type { margin-top: 6px; }
+  aside p, aside li { color: #c3ccd5; font-size: 13px; line-height: 1.6; }
+  aside ul { padding-left: 18px; margin: 6px 0; }
+  aside .sideHead { display: flex; align-items: center; justify-content: space-between; }
+  aside .sideHead h2 { font-size: 14px; margin: 0; }
+  aside .eq { font-family: ui-monospace, Menlo, Consolas, monospace; background: #0b0e12; border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; color: var(--text); display: inline-block; }
+  aside .odd { color: var(--odd); } aside .even { color: var(--even); }
+
+  @media (max-width: 1100px) {
+    .dash {
+      grid-template-columns: minmax(260px, 320px) 1fr;
+      grid-template-areas: "pitch harm" "pitch spec" "reg reg" "sgram sgram" "oe cent";
+    }
+  }
+  @media (max-width: 760px) {
+    .dash { grid-template-columns: 1fr; grid-template-areas: "pitch" "harm" "spec" "reg" "sgram" "oe" "cent"; }
+    #c-sgram { height: 260px; }
+    main, header, .controls { padding-left: 10px; padding-right: 10px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Clarinet Harmonic Visualizer</h1>
+  <div class="spacer"></div>
+  <span id="status" class="status"><span class="dot"></span><span id="statusText"></span></span>
+  <button id="btnMic" class="primary">Start Listening</button>
+  <button id="btnDemo" title="Synthesized clarinet-like tone, no microphone needed">Demo Mode</button>
+  <button id="btnFreeze" title="Freeze all displays (F)">Freeze</button>
+  <button id="btnSnap" title="Download a PNG of the dashboard (P)">Snapshot PNG</button>
+  <button id="btnSide" title="Acoustics notes">Physics</button>
+</header>
+
+<div class="controls">
+  <div class="ctl">FFT size
+    <select id="fftSize">
+      <option value="4096">4096</option><option value="8192">8192</option>
+      <option value="16384" selected>16384</option><option value="32768">32768</option>
+    </select>
+  </div>
+  <div class="ctl">Smoothing <input type="range" id="smooth" min="0" max="0.95" step="0.01" value="0.55"><output id="smoothOut"></output></div>
+  <div class="ctl">Noise floor <input type="range" id="floor" min="-130" max="-40" step="1" value="-95"><output id="floorOut"></output></div>
+  <div class="ctl">Gate <input type="range" id="gate" min="-90" max="-20" step="1" value="-58"><output id="gateOut"></output></div>
+  <div class="ctl">Clarinet
+    <select id="inst"><option value="Bb" selected>B♭</option><option value="A">A</option><option value="C">C</option></select>
+  </div>
+  <label class="chk"><input type="checkbox" id="concert"> Concert pitch</label>
+  <div class="ctl">A4 <input type="number" id="a4" min="415" max="466" step="0.5" value="440"> Hz</div>
+  <label class="chk"><input type="checkbox" id="tmpl"> Ideal template</label>
+  <label class="chk" title="Off: odd = H3+H5+H7... so the ratio reflects timbre rather than fundamental loudness"><input type="checkbox" id="incH1"> Include H1 in odd/even</label>
+  <label class="chk"><input type="checkbox" id="hear" checked> Hear demo</label>
+</div>
+
+<div id="banner" role="alert">
+  <p id="bannerMsg"></p>
+  <button id="bannerDemo">Try Demo Mode</button>
+  <button id="bannerClose">Dismiss</button>
+</div>
+
+<main>
+  <div class="dash" id="dash">
+
+    <section class="panel" id="p-pitch">
+      <h2>Pitch
+        <span class="info" tabindex="0" data-tip="Detected with the YIN algorithm (time-domain period estimation), not FFT peak-picking, so a weak fundamental in the clarion register is still identified correctly. Written pitch is shown by default for the selected clarinet; tick Concert pitch for sounding pitch. Cents are relative to equal temperament at the A4 reference.">i</span>
+      </h2>
+      <div class="noteRow">
+        <span id="noteName" class="noteName" data-snap>–</span><span id="noteOct" class="noteOct" data-snap></span>
+        <span id="h3badge" class="badge" title="3rd harmonic louder than the fundamental (typical of the clarion register)">H3 &gt; H1</span>
+      </div>
+      <canvas id="c-cents"></canvas>
+      <dl class="kv">
+        <dt data-snap>Frequency</dt><dd id="rFreq" data-snap>—</dd>
+        <dt data-snap>Cents</dt><dd id="rCents" data-snap>—</dd>
+        <dt data-snap>Concert</dt><dd id="rConcert" data-snap>—</dd>
+        <dt data-snap>Written</dt><dd id="rWritten" data-snap>—</dd>
+        <dt data-snap>Register</dt><dd id="rReg" data-snap>—</dd>
+        <dt data-snap>Confidence</dt><dd id="rConf" data-snap>—</dd>
+        <dt data-snap>Brightness</dt><dd id="rCent" data-snap>—</dd>
+        <dt data-snap>Odd / even</dt><dd id="rOE" data-snap>—</dd>
+        <dt data-snap>H3 − H1</dt><dd id="rH3" data-snap>—</dd>
+      </dl>
+      <div class="levelWrap">
+        <div class="levelLbl"><span>Input level</span><span id="rLevel">—</span></div>
+        <div class="level"><div id="levelBar" class="levelBar"></div><div id="gateMark" class="gateMark"></div></div>
+      </div>
+    </section>
+
+    <section class="panel" id="p-harm">
+      <h2>Harmonics 1–16
+        <span class="info" tabindex="0" data-tip="Each bar sits at an integer multiple of the detected fundamental; height is the peak level (dBFS) found within ±3% of that frequency. Warm bars are odd harmonics, cool bars are even. A low-register clarinet shows a clear warm/cool alternation. Ideal template (dashed) draws odd harmonics falling as 1/n from your measured H1, with evens 40 dB down.">i</span>
+        <span class="h2spacer"></span><span class="leg odd">odd</span><span class="leg even">even</span>
+      </h2>
+      <canvas id="c-harm"></canvas>
+    </section>
+
+    <section class="panel" id="p-spec">
+      <h2>Spectrum
+        <span class="info" tabindex="0" data-tip="Full FFT magnitude on a log-frequency axis, 50 Hz to 8 kHz. Vertical lines mark the detected harmonic positions. The shaded band marks roughly 1.5–2 kHz, the region associated with the clarinet's tone-hole lattice cutoff and its characteristic formant; above it the odd/even pattern breaks down. The dashed red line is the noise-floor threshold.">i</span>
+        <span class="h2spacer"></span><span class="leg formant">≈1.5–2 kHz band</span>
+      </h2>
+      <canvas id="c-spec"></canvas>
+    </section>
+
+    <section class="panel" id="p-reg">
+      <h2>Register
+        <span class="info" tabindex="0" data-tip="Registers are based on WRITTEN pitch for the selected clarinet: Chalumeau E3–F♯4, Throat G4–B♭4, Clarion B4–C6, Altissimo C♯6 and up. Boundaries vary between teachers; these are common definitions. The highlighted key is the current written note.">i</span>
+      </h2>
+      <canvas id="c-reg"></canvas>
+    </section>
+
+    <section class="panel" id="p-oe">
+      <h2>Odd / even energy
+        <span class="info" tabindex="0" data-tip="10·log10(odd-harmonic power ÷ even-harmonic power), using harmonics 2–16 (H1 optional). Positive values mean odd harmonics dominate. Expect large positive values in the chalumeau and a drop toward 0 dB in the clarion and altissimo, where even harmonics are much stronger.">i</span>
+      </h2>
+      <canvas id="c-oe"></canvas>
+    </section>
+
+    <section class="panel" id="p-cent">
+      <h2>Brightness (spectral centroid)
+        <span class="info" tabindex="0" data-tip="Amplitude-weighted mean frequency of the spectrum between 50 Hz and 8 kHz, ignoring bins below the noise floor. Higher means brighter. Watch it rise during a crescendo as upper partials grow.">i</span>
+      </h2>
+      <canvas id="c-cent"></canvas>
+    </section>
+
+    <section class="panel" id="p-sgram">
+      <h2>Spectrogram
+        <span class="info" tabindex="0" data-tip="Scrolling waterfall: time runs left to right (newest at the right edge), log frequency runs bottom to top, colour is level from the noise floor (black) to −20 dBFS (pale yellow). Register changes show as the harmonic ladder jumping; swells show upper partials fading in.">i</span>
+      </h2>
+      <canvas id="c-sgram"></canvas>
+    </section>
+
+  </div>
+</main>
+
+<aside id="side" aria-label="Clarinet acoustics">
+  <div class="sideHead"><h2>Clarinet acoustics</h2><button id="sideClose">Close</button></div>
+
+  <h3>A closed–open pipe</h3>
+  <p>The clarinet's bore is mostly cylindrical. At the mouthpiece the reed behaves acoustically like a <b>closed end</b> (a pressure maximum), while the first open tone hole, or the bell, acts as an <b>open end</b> (a pressure minimum). A cylinder closed at one end resonates when its length is an odd number of quarter wavelengths:</p>
+  <p><span class="eq">f<sub>k</sub> = (2k − 1) · c / 4L &nbsp;→&nbsp; 1×, 3×, 5×, 7× …</span></p>
+  <p>Only odd multiples of the lowest resonance are supported, which is why low-register clarinet tone shows strong <span class="odd">odd</span> and weak <span class="even">even</span> harmonics. It is also why a clarinet sounds about an octave lower than a flute of similar length.</p>
+  <p>The even harmonics are never truly zero: the reed's airflow is nonlinear and generates every harmonic, the bore is not a perfect cylinder (mouthpiece, barrel, bell, tone holes), and above the tone-hole cutoff (roughly 1.5–2 kHz) open holes stop reflecting cleanly, so the odd/even pattern fades out.</p>
+
+  <h3>Why it overblows at the twelfth</h3>
+  <p>The register key opens a small vent near the top of the bore. That vent disturbs the lowest resonance much more than the next one, so the reed locks onto the next available resonance, which is the 3rd harmonic. A 3:1 frequency ratio is an octave plus a perfect fifth, a <b>twelfth</b> (19 semitones; 1902 cents as a pure ratio, 1900 in equal temperament).</p>
+  <p>Flutes (open at both ends) and oboes and saxophones (conical bores) support all harmonics, so they overblow at the octave instead. One register vent serves many fingerings, so its position is a compromise, which is part of why some clarion notes need adjustment.</p>
+
+  <h3>The register break</h3>
+  <p>The throat tones (written G4 to B♭4) are still lowest-resonance notes, but they use a very short sounding tube with few fingers down, and B♭4 uses the register key as a vent. They tend to be stuffier. The next note up, written B4, is the first clarion note: almost every hole closed plus the register key, sounding a twelfth above low E3.</p>
+  <p>Going from B♭4 to B4 means moving from nearly no fingers to nearly all of them at once. That transition is the <b>break</b>, and players speak of "crossing the break".</p>
+
+  <h3>Clarion and altissimo spectra</h3>
+  <p>In the clarion the played note sits on the bore's second resonance, so the bore's resonances no longer line up with the odd harmonics of the played note. Even harmonics become much stronger and the odd/even meter drops. Microphone recordings of clarion notes often show H3 at or above H1, helped by sound radiating more efficiently at higher frequencies; the <b>H3 &gt; H1</b> badge lights up when that happens.</p>
+
+  <h3>How the pitch is found</h3>
+  <p>This tool uses <b>YIN</b>: it compares the waveform with delayed copies of itself, normalizes the difference so lag zero doesn't win, and picks the first lag whose difference dips below a threshold. That lag is one period of the waveform, whatever the relative loudness of the harmonics, which is why it handles a weak clarion fundamental where "loudest FFT peak" would not.</p>
+
+  <h3>Reading the displays</h3>
+  <ul>
+    <li><b>Noise floor</b> hides spectrum content below it, sets the spectrogram's black level, and excludes weak harmonics from the meters.</li>
+    <li><b>Gate</b> is a level threshold (dBFS, RMS). Below it, pitch and harmonic readouts blank out.</li>
+    <li><b>Larger FFT</b> sizes resolve low harmonics better but smear fast changes; 16384 is a good default.</li>
+    <li><b>Demo mode</b> plays a B♭ clarinet-style synth through all four registers and a crescendo swell.</li>
+  </ul>
+</aside>
+
+<script>
+'use strict';
+(() => {
+  // =====================================================================
+  //  Constants
+  // =====================================================================
+  const FMIN_VIEW = 50, FMAX_VIEW = 8000;     // spectrum / spectrogram range
+  const MIN_F0 = 90, MAX_F0 = 2400;           // pitch search range (covers bass of A clarinet to top altissimo)
+  const YIN_W = 2048;                          // YIN integration window (samples)
+  const YIN_THRESH = 0.15;                     // YIN absolute threshold on the CMND function
+  const NH = 16;                               // harmonics displayed
+  const HIST = 360;                            // history length (frames) for line graphs
+  const TRANSPOSE = { Bb: 2, A: 3, C: 0 };     // written = concert + n semitones
+  const NAMES = ['C', 'C♯', 'D', 'E♭', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'B♭', 'B'];
+  const WHITE = [1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1];
+  // Registers on WRITTEN MIDI note numbers (E3 = 52)
+  const REGISTERS = [
+    { name: 'Chalumeau', lo: 52, hi: 66,  color: '#ff8a3d' },
+    { name: 'Throat',    lo: 67, hi: 70,  color: '#ffd166' },
+    { name: 'Clarion',   lo: 71, hi: 84,  color: '#3db8ff' },
+    { name: 'Altissimo', lo: 85, hi: 108, color: '#c08cff' },
+  ];
+  const STRIP_LO = 52, STRIP_HI = 96;          // keyboard strip: written E3..C7
+  const COL = {
+    grid: '#1b2229', axis: '#5c6873', text: '#8b98a5', bright: '#e6edf3',
+    odd: '#ff8a3d', oddHi: '#ffc896', even: '#3db8ff', evenHi: '#a6e0ff',
+    accent: '#9ef0c8', warn: '#ffd166', bad: '#ff5d6c',
+    formantFill: 'rgba(192,140,255,0.10)', formantLine: 'rgba(192,140,255,0.45)',
+  };
+  const FONT = '11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+  const $ = (id) => document.getElementById(id);
+
+  // =====================================================================
+  //  State
+  // =====================================================================
+  const S = {
+    ctx: null, analyser: null, stream: null, micSrc: null, demo: null,
+    mode: 'idle',            // 'idle' | 'mic' | 'demo'
+    frozen: false,
+    fftSize: 16384, smoothing: 0.55, noiseFloor: -95, gateDb: -58,
+    instrument: 'Bb', concert: false, a4: 440,
+    template: false, includeH1: false, hearDemo: true,
+  };
+
+  // Analysis results (read by the draw functions; persist while frozen)
+  const A = {
+    voiced: false, f0: 0, conf: 0, midiF: 0, cents: 0, rmsDb: -120,
+    ratioDb: NaN, centroid: NaN, h3: false,
+  };
+  const hDb = new Float32Array(NH + 1).fill(NaN);   // measured harmonic levels (dBFS)
+  const hFreq = new Float32Array(NH + 1);           // measured harmonic peak frequencies (0 = out of range)
+  const disp = new Float32Array(NH + 1).fill(-200); // eased bar heights for display
+
+  let sr = 48000, binHz = sr / S.fftSize;
+  let freqDb = null, timeBuf = null, yinBuf = null;
+  const pitchHist = [];
+  let unvoicedFrames = 99, frameNo = 0;
+
+  class Ring {
+    constructor(n) { this.a = new Float32Array(n).fill(NaN); this.i = 0; this.n = n; }
+    push(v) { this.a[this.i] = v; this.i = (this.i + 1) % this.n; }
+    get(k) { return this.a[(this.i + k) % this.n]; }      // k = 0 is the oldest sample
+    clear() { this.a.fill(NaN); }
+  }
+  const oeHist = new Ring(HIST), centHist = new Ring(HIST);
+
+  // =====================================================================
+  //  Small helpers
+  // =====================================================================
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const mod12 = (m) => ((m % 12) + 12) % 12;
+  const noteStr = (m) => NAMES[mod12(m)] + (Math.floor(m / 12) - 1);
+  const midiFromHz = (f) => 69 + 12 * Math.log2(f / S.a4);
+  const fmtHz = (f) => (f >= 1000 ? (f / 1000).toFixed(f >= 10000 ? 0 : 2) + 'k' : Math.round(f).toString());
+  const registerOf = (writtenMidi) => REGISTERS.find((r) => writtenMidi >= r.lo && writtenMidi <= r.hi) || null;
+  function median(arr) { const s = arr.slice().sort((a, b) => a - b); return s[s.length >> 1]; }
+  function setText(el, txt) { if (el.textContent !== txt) el.textContent = txt; }  // avoids needless DOM writes
+  function hexToRgb(h) { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+  function mix(a, b, t) {
+    const A1 = hexToRgb(a), B1 = hexToRgb(b);
+    return `rgb(${Math.round(A1[0] + (B1[0] - A1[0]) * t)},${Math.round(A1[1] + (B1[1] - A1[1]) * t)},${Math.round(A1[2] + (B1[2] - A1[2]) * t)})`;
+  }
+
+  // Spectrogram colour map (magma-like), 256-entry RGB lookup table
+  const LUT = (() => {
+    const stops = [[0, '#05040c'], [0.18, '#1d1147'], [0.36, '#51127c'], [0.52, '#832681'],
+                   [0.66, '#c03a76'], [0.78, '#ed5a5f'], [0.89, '#fd9a6a'], [1, '#fcfdbf']];
+    const lut = new Uint8ClampedArray(256 * 3);
+    for (let i = 0; i < 256; i++) {
+      const t = i / 255;
+      let k = 0; while (k < stops.length - 2 && t > stops[k + 1][0]) k++;
+      const [t0, c0] = stops[k], [t1, c1] = stops[k + 1];
+      const u = (t - t0) / (t1 - t0), a = hexToRgb(c0), b = hexToRgb(c1);
+      for (let j = 0; j < 3; j++) lut[i * 3 + j] = a[j] + (b[j] - a[j]) * u;
+    }
+    return lut;
+  })();
+
+  // =====================================================================
+  //  Log-frequency pixel <-> FFT bin mapping
+  //  For each pixel we either take the MAX over all bins it covers (high
+  //  frequencies, many bins per pixel) or linearly interpolate between two
+  //  bins (low frequencies, many pixels per bin). Precomputed per size.
+  // =====================================================================
+  function buildLogMap(n) {
+    const lo = new Int32Array(n), hi = new Int32Array(n), frac = new Float32Array(n);
+    const ratio = FMAX_VIEW / FMIN_VIEW, maxBin = (freqDb ? freqDb.length : S.fftSize / 2) - 2;
+    for (let i = 0; i < n; i++) {
+      const ba = FMIN_VIEW * Math.pow(ratio, i / n) / binHz;
+      const bb = FMIN_VIEW * Math.pow(ratio, (i + 1) / n) / binHz;
+      if (bb - ba >= 1) {
+        lo[i] = clamp(Math.ceil(ba), 0, maxBin); hi[i] = clamp(Math.floor(bb), lo[i], maxBin); frac[i] = -1;
+      } else {
+        const c = (ba + bb) / 2; lo[i] = clamp(Math.floor(c), 0, maxBin); hi[i] = -1; frac[i] = c - lo[i];
+      }
+    }
+    return { lo, hi, frac, key: n + '|' + binHz };
+  }
+  function sampleMap(m, i, data) {
+    const lo = m.lo[i], hi = m.hi[i];
+    if (hi >= 0) { let v = data[lo]; for (let k = lo + 1; k <= hi; k++) if (data[k] > v) v = data[k]; return v; }
+    const a = data[lo], b = data[lo + 1]; return a + (b - a) * m.frac[i];
+  }
+
+  // =====================================================================
+  //  PITCH DETECTION: YIN
+  //  1. Difference function   d(τ) = Σ_j (x[j] − x[j+τ])²   over a window W
+  //  2. Cumulative mean normalized difference (CMND)
+  //        d'(0) = 1,  d'(τ) = d(τ) · τ / Σ_{k=1..τ} d(k)
+  //     This removes the bias toward τ = 0 and makes a single threshold usable.
+  //  3. Absolute threshold: first τ with d'(τ) < threshold, then walk down to
+  //     the local minimum. Taking the FIRST dip (smallest period) instead of
+  //     the deepest one prevents sub-octave errors; because YIN measures the
+  //     period of the whole waveform, a weak fundamental (strong H3) is still
+  //     detected at the correct pitch.
+  //  4. Parabolic interpolation around the minimum for sub-sample precision.
+  //  Confidence is reported as 1 − d'(τ).
+  // =====================================================================
+  // YIN-BEGIN
+  function yin(buf, sampleRate, out) {
+    const tauMin = Math.max(2, Math.floor(sampleRate / MAX_F0));
+    const tauMax = Math.floor(sampleRate / MIN_F0);
+    const W = YIN_W, start = buf.length - W - tauMax - 1;
+    if (start < 0) return null;
+    const d = out;
+    d[0] = 1;
+    let running = 0;
+    for (let tau = 1; tau <= tauMax + 1; tau++) {
+      let s = 0;
+      for (let j = 0; j < W; j++) { const diff = buf[start + j] - buf[start + j + tau]; s += diff * diff; }
+      running += s;
+      d[tau] = running > 0 ? (s * tau) / running : 1;
+    }
+    let tau = -1;
+    for (let t = tauMin; t <= tauMax; t++) {
+      if (d[t] < YIN_THRESH) { while (t + 1 <= tauMax && d[t + 1] < d[t]) t++; tau = t; break; }
+    }
+    if (tau < 0) {                         // no dip under threshold: accept global minimum only if reasonably periodic
+      let best = tauMin;
+      for (let t = tauMin + 1; t <= tauMax; t++) if (d[t] < d[best]) best = t;
+      if (d[best] < 0.3) tau = best; else return null;
+    }
+    let refined = tau;
+    const s0 = d[tau - 1], s1 = d[tau], s2 = d[tau + 1], den = s0 + s2 - 2 * s1;
+    if (den > 1e-12) refined = tau + clamp((s0 - s2) / (2 * den), -1, 1);
+    return { f0: sampleRate / refined, conf: clamp(1 - d[tau], 0, 1) };
+  }
+  // YIN-END
+
+  // =====================================================================
+  //  Audio setup
+  // =====================================================================
+  function ensureContext() {
+    if (!S.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      S.ctx = new AC({ latencyHint: 'interactive' });
+      S.analyser = S.ctx.createAnalyser();
+      S.analyser.minDecibels = -140; S.analyser.maxDecibels = 0;
+      sr = S.ctx.sampleRate;
+      yinBuf = new Float32Array(Math.floor(sr / MIN_F0) + 3);
+      configureAnalyser();
+    }
+    if (S.ctx.state === 'suspended') S.ctx.resume();
+  }
+  function configureAnalyser() {
+    if (!S.analyser) { binHz = sr / S.fftSize; return; }
+    S.analyser.fftSize = S.fftSize;
+    S.analyser.smoothingTimeConstant = S.smoothing;
+    freqDb = new Float32Array(S.analyser.frequencyBinCount).fill(-200);
+    timeBuf = new Float32Array(S.fftSize);
+    binHz = sr / S.fftSize;
+    specMap = null; SG.map = null;   // force mapping rebuild
+    updateStatus();
+  }
+
+  function stopAll() {
+    if (S.stream) { S.stream.getTracks().forEach((t) => t.stop()); S.stream = null; }
+    if (S.micSrc) { S.micSrc.disconnect(); S.micSrc = null; }
+    if (S.demo) { S.demo.stop(); S.demo = null; }
+    S.mode = 'idle';
+    A.voiced = false; pitchHist.length = 0;
+    updateButtons(); updateStatus();
+  }
+
+  async function startMic() {
+    hideBanner();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      showBanner('This browser only allows microphone access on secure pages. Serve the file locally (for example run <code>python3 -m http.server</code> in its folder, then open <code>http://localhost:8000</code>) or use https.');
+      return;
+    }
+    ensureContext();
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
+      });
+    } catch (err) {
+      const name = err && err.name;
+      let msg;
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError')
+        msg = 'Microphone access was blocked. Allow the microphone for this page in your browser\'s site settings (the icon in the address bar), then press Start Listening again.';
+      else if (name === 'NotFoundError' || name === 'DevicesNotFoundError')
+        msg = 'No microphone was found. Connect one and try again.';
+      else if (name === 'NotReadableError' || name === 'TrackStartError')
+        msg = 'The microphone could not be opened. Another app may be using it.';
+      else if (name === 'SecurityError')
+        msg = 'Microphone access is not allowed in this context. Serve the page over https or http://localhost.';
+      else msg = 'Could not start the microphone: ' + (err && err.message ? err.message : String(err));
+      showBanner(msg);
+      return;
+    }
+    stopAll();
+    S.stream = stream;
+    S.micSrc = S.ctx.createMediaStreamSource(stream);
+    S.micSrc.connect(S.analyser);          // NOT connected to speakers (avoids feedback)
+    S.mode = 'mic';
+    resetHistories();
+    updateButtons(); updateStatus();
+  }
+
+  function startDemo() {
+    hideBanner();
+    ensureContext();
+    stopAll();
+    S.demo = createDemo(S.ctx, S.analyser);
+    S.mode = 'demo';
+    resetHistories();
+    updateButtons(); updateStatus();
+  }
+
+  function resetHistories() { oeHist.clear(); centHist.clear(); pitchHist.length = 0; disp.fill(-200); }
+
+  // =====================================================================
+  //  DEMO MODE: clarinet-like synth
+  //  PeriodicWave with odd harmonics at 1/n and a much weaker even
+  //  component (0.12/n). Clarion and altissimo patches strengthen evens and
+  //  weaken H1 (so H3 > H1 can be seen). A sequence walks through all four
+  //  registers (written pitch for B♭ clarinet), then a crescendo swell where
+  //  a low-pass opens to brighten the tone. Light breath noise and a slight
+  //  vibrato keep the pitch tracker honest.
+  // =====================================================================
+  function createDemo(ctx, dest) {
+    const osc = ctx.createOscillator();
+    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 4500; lp.Q.value = 0.4;
+    const env = ctx.createGain(); env.gain.value = 0.0001;
+    const mon = ctx.createGain(); mon.gain.value = S.hearDemo ? 0.25 : 0;
+    osc.connect(lp); lp.connect(env); env.connect(dest); env.connect(mon); mon.connect(ctx.destination);
+
+    const nb = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate), nd = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    const ns = ctx.createBufferSource(); ns.buffer = nb; ns.loop = true;
+    const nbp = ctx.createBiquadFilter(); nbp.type = 'bandpass'; nbp.frequency.value = 2500; nbp.Q.value = 0.7;
+    const ng = ctx.createGain(); ng.gain.value = 0.012;
+    ns.connect(nbp); nbp.connect(ng); ng.connect(env);
+
+    const lfo = ctx.createOscillator(); lfo.frequency.value = 5.2;
+    const lfoG = ctx.createGain(); lfoG.gain.value = 0;
+    lfo.connect(lfoG); lfoG.connect(osc.frequency);
+
+    function wave(kind) {
+      const N = 32, re = new Float32Array(N + 1), im = new Float32Array(N + 1);
+      for (let n = 1; n <= N; n++) {
+        let a = n % 2 ? 1 / n : 0.12 / n;                                   // odd 1/n, weak even
+        if (kind === 'Throat')    { if (n % 2 === 0) a *= 1.6; if (n > 5) a *= 0.7; }
+        if (kind === 'Clarion')   { if (n === 1) a *= 0.42; if (n === 3) a *= 1.7; if (n % 2 === 0) a *= 2.5; }
+        if (kind === 'Altissimo') { if (n % 2 === 0) a *= 3; a *= Math.pow(0.8, n - 1); }
+        im[n] = a;
+      }
+      return ctx.createPeriodicWave(re, im);
+    }
+    const waves = {};
+    REGISTERS.forEach((r) => { waves[r.name] = wave(r.name); });
+
+    // Written pitches for B♭ clarinet (sounding = written − 2)
+    const SEQ = [52, 57, 60, 64, 67, 70, 71, 74, 79, 84, 88, 91].map((w) => ({ w, d: 1.3 }));
+    SEQ.push({ w: 60, d: 4.2, swell: true });
+
+    let idx = 0, timer = 0;
+    osc.start(); ns.start(); lfo.start();
+
+    function play() {
+      const item = SEQ[idx++ % SEQ.length];
+      const now = ctx.currentTime;
+      env.gain.cancelScheduledValues(now);
+      env.gain.setValueAtTime(Math.max(env.gain.value, 0.0001), now);
+      env.gain.linearRampToValueAtTime(0.0001, now + 0.04);              // short gap between notes
+      timer = setTimeout(() => {
+        const t = ctx.currentTime, f = 440 * Math.pow(2, (item.w - 2 - 69) / 12);
+        osc.setPeriodicWave(waves[(registerOf(item.w) || REGISTERS[0]).name]);
+        osc.frequency.setValueAtTime(f, t);
+        lfoG.gain.setValueAtTime(f * 0.0015, t);
+        env.gain.cancelScheduledValues(t); env.gain.setValueAtTime(0.0001, t);
+        lp.frequency.cancelScheduledValues(t);
+        if (item.swell) {
+          env.gain.linearRampToValueAtTime(0.05, t + 0.08);
+          env.gain.linearRampToValueAtTime(0.55, t + item.d * 0.5);
+          env.gain.linearRampToValueAtTime(0.05, t + item.d - 0.06);
+          lp.frequency.setValueAtTime(1500, t);
+          lp.frequency.linearRampToValueAtTime(7000, t + item.d * 0.5);
+          lp.frequency.linearRampToValueAtTime(1500, t + item.d - 0.06);
+        } else {
+          env.gain.linearRampToValueAtTime(0.32, t + 0.06);
+          lp.frequency.setValueAtTime(4500, t);
+        }
+        timer = setTimeout(play, item.d * 1000 - 45);
+      }, 45);
+    }
+    play();
+
+    return {
+      mon,
+      stop() {
+        clearTimeout(timer);
+        try { osc.stop(); ns.stop(); lfo.stop(); } catch (e) { /* already stopped */ }
+        [osc, lp, env, mon, ns, nbp, ng, lfo, lfoG].forEach((n) => n.disconnect());
+      },
+    };
+  }
+
+  // =====================================================================
+  //  Per-frame analysis
+  // =====================================================================
+  function analyze() {
+    const an = S.analyser;
+    an.getFloatFrequencyData(freqDb);
+    an.getFloatTimeDomainData(timeBuf);
+
+    // Sanitize -Infinity (digital silence) in the range we use
+    const lim = Math.min(freqDb.length, Math.ceil((FMAX_VIEW * 1.2) / binHz) + 4);
+    for (let i = 0; i < lim; i++) { const v = freqDb[i]; if (!(v > -200)) freqDb[i] = -200; }
+
+    // Input RMS over the most recent YIN window -> noise gate
+    let ss = 0;
+    for (let i = timeBuf.length - YIN_W; i < timeBuf.length; i++) ss += timeBuf[i] * timeBuf[i];
+    A.rmsDb = 10 * Math.log10(ss / YIN_W + 1e-14);
+    const gateOpen = A.rmsDb > S.gateDb;
+
+    // Pitch (median of the last 5 YIN estimates; brief dropouts are held for 4 frames)
+    const det = gateOpen ? yin(timeBuf, sr, yinBuf) : null;
+    if (det) {
+      pitchHist.push(det.f0); if (pitchHist.length > 5) pitchHist.shift();
+      A.f0 = median(pitchHist); A.conf = det.conf; A.voiced = true; unvoicedFrames = 0;
+    } else if (++unvoicedFrames > 4) {
+      A.voiced = false; pitchHist.length = 0;
+    }
+
+    if (A.voiced) {
+      A.midiF = midiFromHz(A.f0);
+      A.cents = (A.midiF - Math.round(A.midiF)) * 100;
+      measureHarmonics();
+      computeOddEven();
+      // H3 > H1 indicator with 0.5 dB hysteresis
+      if (isFinite(hDb[3]) && isFinite(hDb[1])) {
+        if (hDb[3] > hDb[1] + 0.5) A.h3 = true; else if (hDb[3] < hDb[1] - 0.5) A.h3 = false;
+      } else A.h3 = false;
+    } else {
+      hDb.fill(NaN); hFreq.fill(0); A.ratioDb = NaN; A.h3 = false;
+    }
+
+    A.centroid = gateOpen ? spectralCentroid() : NaN;
+    oeHist.push(A.voiced ? A.ratioDb : NaN);
+    centHist.push(A.centroid);
+
+    // Ease bar heights (fast attack, gentle release) for a steady display
+    for (let n = 1; n <= NH; n++) {
+      const target = A.voiced && isFinite(hDb[n]) ? hDb[n] : S.noiseFloor - 20;
+      const k = target > disp[n] ? 0.6 : 0.25;
+      disp[n] = disp[n] < -150 ? target : disp[n] + (target - disp[n]) * k;
+    }
+  }
+
+  // Find each harmonic's peak within ±3% (and at most ±35% of f0) of n·f0
+  function measureHarmonics() {
+    const f0 = A.f0, lim = Math.min(FMAX_VIEW, (sr / 2) * 0.98);
+    for (let n = 1; n <= NH; n++) {
+      const fn = n * f0;
+      if (fn > lim) { hDb[n] = NaN; hFreq[n] = 0; continue; }
+      const half = Math.min(0.03 * fn, 0.35 * f0);
+      const lo = Math.max(1, Math.floor((fn - half) / binHz));
+      const hi = Math.min(freqDb.length - 2, Math.ceil((fn + half) / binHz));
+      let bi = lo;
+      for (let k = lo + 1; k <= hi; k++) if (freqDb[k] > freqDb[bi]) bi = k;
+      const a = freqDb[bi - 1], b = freqDb[bi], c = freqDb[bi + 1], den = a - 2 * b + c;
+      const off = den < 0 ? clamp((0.5 * (a - c)) / den, -0.5, 0.5) : 0;   // parabolic peak refinement
+      hDb[n] = b - 0.25 * (a - c) * off;
+      hFreq[n] = (bi + off) * binHz;
+    }
+  }
+
+  function computeOddEven() {
+    let odd = 0, even = 0;
+    const fl = S.noiseFloor;
+    for (let n = 1; n <= NH; n++) {
+      const v = hDb[n]; if (!isFinite(v)) continue;
+      const p = Math.pow(10, Math.max(v, fl) / 10);     // below-floor harmonics count as floor-level
+      if (n % 2) { if (n > 1 || S.includeH1) odd += p; } else even += p;
+    }
+    A.ratioDb = even > 0 && odd > 0 ? 10 * Math.log10(odd / even) : NaN;
+  }
+
+  function spectralCentroid() {
+    const b0 = Math.ceil(FMIN_VIEW / binHz), b1 = Math.min(freqDb.length - 1, Math.floor(FMAX_VIEW / binHz));
+    const fl = S.noiseFloor;
+    let num = 0, den = 0;
+    for (let k = b0; k <= b1; k++) {
+      const v = freqDb[k];
+      if (v > fl) { const m = Math.pow(10, v / 20); num += m * k; den += m; }
+    }
+    return den > 0 ? (num / den) * binHz : NaN;
+  }
+
+  // =====================================================================
+  //  Canvas management (sizes read only in ResizeObserver -> no layout thrash)
+  // =====================================================================
+  const CV = {};
+  const ro = new ResizeObserver((entries) => {
+    const dpr = window.devicePixelRatio || 1;
+    for (const e of entries) {
+      const c = CV[e.target.dataset.key];
+      const r = e.contentRect;
+      c.w = r.width; c.h = r.height; c.dpr = dpr;
+      c.cv.width = Math.max(1, Math.round(r.width * dpr));
+      c.cv.height = Math.max(1, Math.round(r.height * dpr));
+      c.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      if (c.onResize) c.onResize(c);
+    }
+    drawAll();
+  });
+  function reg(key, id, onResize) {
+    const cv = $(id); cv.dataset.key = key;
+    CV[key] = { cv, ctx: cv.getContext('2d'), w: 0, h: 0, dpr: 1, onResize };
+    ro.observe(cv);
+  }
+
+  let specMap = null;
+  // Offscreen buffer for the scrolling spectrogram (device-pixel resolution)
+  const SG = { cv: null, ctx: null, pw: 0, ph: 0, step: 1, col: null, map: null, L: 46, R: 8, T: 6, B: 18 };
+  function sgResize(c) {
+    const pwCss = Math.max(1, c.w - SG.L - SG.R), phCss = Math.max(1, c.h - SG.T - SG.B);
+    const pw = Math.max(1, Math.round(pwCss * c.dpr)), ph = Math.max(1, Math.round(phCss * c.dpr));
+    if (SG.cv && SG.pw === pw && SG.ph === ph) return;
+    const nc = document.createElement('canvas'); nc.width = pw; nc.height = ph;
+    const nx = nc.getContext('2d');
+    nx.fillStyle = `rgb(${LUT[0]},${LUT[1]},${LUT[2]})`; nx.fillRect(0, 0, pw, ph);
+    if (SG.cv) nx.drawImage(SG.cv, 0, 0, pw, ph);          // keep history across resizes
+    SG.cv = nc; SG.ctx = nx; SG.pw = pw; SG.ph = ph;
+    SG.step = Math.max(1, Math.round(c.dpr));
+    SG.col = nx.createImageData(SG.step, ph);
+    SG.map = null;
+  }
+
+  // =====================================================================
+  //  Drawing
+  // =====================================================================
+  function drawAll() {
+    drawHarm(); drawSpec(); drawSgram(); drawReg(); drawOE(); drawCent(); drawCents();
+  }
+
+  // 1. Harmonic bars --------------------------------------------------
+  function drawHarm() {
+    const c = CV.harm; if (!c || !c.w) return;
+    const g = c.ctx, w = c.w, h = c.h;
+    g.clearRect(0, 0, w, h);
+    const L = 40, R = 8, T = 16, B = 36, pw = w - L - R, ph = h - T - B;
+    const top = -10, bot = S.noiseFloor;
+    const y = (db) => T + ((top - clamp(db, bot, top)) / (top - bot)) * ph;
+
+    g.font = FONT; g.lineWidth = 1;
+    g.textAlign = 'right'; g.textBaseline = 'middle';
+    for (let db = Math.ceil(bot / 10) * 10; db <= top; db += 10) {
+      const yy = Math.round(y(db)) + 0.5;
+      g.strokeStyle = COL.grid; g.beginPath(); g.moveTo(L, yy); g.lineTo(L + pw, yy); g.stroke();
+      g.fillStyle = COL.axis; g.fillText(db, L - 6, yy);
+    }
+    g.textAlign = 'left'; g.fillText('dBFS', 2, 7);
+
+    const slot = pw / NH, bw = Math.max(4, slot * 0.62);
+    for (let n = 1; n <= NH; n++) {
+      const x0 = L + (n - 1) * slot, xb = x0 + (slot - bw) / 2, odd = n % 2 === 1, v = disp[n];
+      if (v > bot + 0.25) {
+        const yt = y(v);
+        const grd = g.createLinearGradient(0, yt, 0, T + ph);
+        grd.addColorStop(0, odd ? COL.oddHi : COL.evenHi);
+        grd.addColorStop(1, odd ? COL.odd : COL.even);
+        g.globalAlpha = A.voiced ? 1 : 0.4;
+        g.fillStyle = grd; g.fillRect(xb, yt, bw, T + ph - yt);
+        g.globalAlpha = 1;
+        if (A.voiced && slot > 24 && isFinite(hDb[n])) {
+          g.fillStyle = COL.bright; g.textAlign = 'center'; g.textBaseline = 'bottom';
+          g.fillText(Math.round(v), x0 + slot / 2, Math.max(T + 10, yt - 3));
+        }
+      }
+      g.textAlign = 'center'; g.textBaseline = 'top';
+      g.fillStyle = odd ? COL.odd : COL.even;
+      g.fillText('H' + n, x0 + slot / 2, T + ph + 5);
+      if (slot > 28) {
+        g.fillStyle = COL.axis;
+        g.fillText(A.voiced && hFreq[n] ? fmtHz(hFreq[n]) : '—', x0 + slot / 2, T + ph + 19);
+      }
+    }
+
+    // Ideal clarinet template: odd harmonics at H1 − 20·log10(n), evens 40 dB down
+    if (S.template && A.voiced && isFinite(hDb[1])) {
+      const ref = hDb[1];
+      g.lineWidth = 2; g.setLineDash([5, 3]);
+      for (let n = 1; n <= NH; n++) {
+        if (!hFreq[n]) continue;
+        const t = n % 2 ? ref - 20 * Math.log10(n) : ref - 40;
+        if (t <= bot) continue;
+        const x0 = L + (n - 1) * slot, xb = x0 + (slot - bw) / 2, yy = Math.round(y(t)) + 0.5;
+        g.strokeStyle = n % 2 ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.35)';
+        g.beginPath(); g.moveTo(xb - 3, yy); g.lineTo(xb + bw + 3, yy); g.stroke();
+      }
+      g.setLineDash([]); g.lineWidth = 1;
+      g.fillStyle = COL.bright; g.textAlign = 'right'; g.textBaseline = 'top';
+      g.fillText('- - ideal: odd 1/n, even −40 dB', L + pw, 2);
+    }
+  }
+
+  // 2. Full spectrum --------------------------------------------------
+  const FTICKS = [50, 100, 200, 500, 1000, 2000, 5000, 8000];
+  function drawSpec() {
+    const c = CV.spec; if (!c || !c.w) return;
+    const g = c.ctx, w = c.w, h = c.h;
+    g.clearRect(0, 0, w, h);
+    const L = 40, R = 8, T = 14, B = 20, pw = w - L - R, ph = h - T - B;
+    const dbMax = -10, dbMin = Math.min(-120, S.noiseFloor - 10);
+    const lr = Math.log(FMAX_VIEW / FMIN_VIEW);
+    const xf = (f) => L + (Math.log(f / FMIN_VIEW) / lr) * pw;
+    const yd = (db) => T + ((dbMax - clamp(db, dbMin, dbMax)) / (dbMax - dbMin)) * ph;
+
+    // Formant band ~1500–2000 Hz
+    g.fillStyle = COL.formantFill; g.fillRect(xf(1500), T, xf(2000) - xf(1500), ph);
+    g.strokeStyle = COL.formantLine; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(Math.round(xf(1500)) + .5, T); g.lineTo(Math.round(xf(1500)) + .5, T + ph);
+    g.moveTo(Math.round(xf(2000)) + .5, T); g.lineTo(Math.round(xf(2000)) + .5, T + ph); g.stroke();
+
+    // Grid
+    g.font = FONT;
+    g.textAlign = 'right'; g.textBaseline = 'middle';
+    for (let db = Math.ceil(dbMin / 20) * 20; db <= dbMax; db += 20) {
+      const yy = Math.round(yd(db)) + .5;
+      g.strokeStyle = COL.grid; g.beginPath(); g.moveTo(L, yy); g.lineTo(L + pw, yy); g.stroke();
+      g.fillStyle = COL.axis; g.fillText(db, L - 6, yy);
+    }
+    g.textAlign = 'center'; g.textBaseline = 'top';
+    for (const f of FTICKS) {
+      const xx = Math.round(xf(f)) + .5;
+      g.strokeStyle = COL.grid; g.beginPath(); g.moveTo(xx, T); g.lineTo(xx, T + ph); g.stroke();
+      g.fillStyle = COL.axis; g.fillText(fmtHz(f), clamp(xx, L + 10, L + pw - 10), T + ph + 5);
+    }
+
+    // Noise-floor line
+    const yfl = Math.round(yd(S.noiseFloor)) + .5;
+    g.strokeStyle = 'rgba(255,93,108,0.55)'; g.setLineDash([4, 4]);
+    g.beginPath(); g.moveTo(L, yfl); g.lineTo(L + pw, yfl); g.stroke(); g.setLineDash([]);
+
+    if (!freqDb || S.mode === 'idle' && !S.frozen && !S.ctx) {
+      return;
+    }
+
+    // Harmonic guide lines
+    if (A.voiced) {
+      g.textBaseline = 'top';
+      for (let n = 1; n <= NH; n++) {
+        const f = hFreq[n]; if (!f || f < FMIN_VIEW) continue;
+        const xx = Math.round(xf(f)) + .5;
+        g.strokeStyle = n % 2 ? 'rgba(255,138,61,0.45)' : 'rgba(61,184,255,0.45)';
+        g.beginPath(); g.moveTo(xx, T); g.lineTo(xx, T + ph); g.stroke();
+        if (n <= 10 || n % 2 === 1) { g.fillStyle = n % 2 ? COL.odd : COL.even; g.fillText(n, xx, 1); }
+      }
+    }
+
+    // Spectrum curve
+    const n = Math.max(2, Math.floor(pw));
+    if (!specMap || specMap.key !== n + '|' + binHz) specMap = buildLogMap(n);
+    g.beginPath();
+    g.moveTo(L, T + ph);
+    for (let i = 0; i < n; i++) g.lineTo(L + (i / (n - 1)) * pw, yd(sampleMap(specMap, i, freqDb)));
+    g.lineTo(L + pw, T + ph); g.closePath();
+    const grd = g.createLinearGradient(0, T, 0, T + ph);
+    grd.addColorStop(0, 'rgba(158,240,200,0.35)'); grd.addColorStop(1, 'rgba(158,240,200,0.02)');
+    g.fillStyle = grd; g.fill();
+    g.beginPath();
+    for (let i = 0; i < n; i++) {
+      const xx = L + (i / (n - 1)) * pw, yy = yd(sampleMap(specMap, i, freqDb));
+      if (i) g.lineTo(xx, yy); else g.moveTo(xx, yy);
+    }
+    g.strokeStyle = COL.accent; g.lineWidth = 1.25; g.stroke(); g.lineWidth = 1;
+
+    // Template dots
+    if (S.template && A.voiced && isFinite(hDb[1])) {
+      g.fillStyle = '#ffffff';
+      for (let k = 1; k <= NH; k += 2) {
+        if (!hFreq[k]) continue;
+        const t = hDb[1] - 20 * Math.log10(k);
+        if (t < dbMin) continue;
+        g.beginPath(); g.arc(xf(k * A.f0), yd(t), 2.6, 0, Math.PI * 2); g.fill();
+      }
+    }
+  }
+
+  // 3. Spectrogram ----------------------------------------------------
+  function advanceSpectrogram() {
+    if (!SG.cv || !freqDb) return;
+    const H = SG.ph, step = SG.step;
+    if (!SG.map || SG.map.key !== H + '|' + binHz) SG.map = buildLogMap(H);
+    SG.ctx.drawImage(SG.cv, -step, 0);                    // scroll left
+    const d = SG.col.data, lo = S.noiseFloor, span = -20 - lo;
+    for (let r = 0; r < H; r++) {
+      const v = sampleMap(SG.map, H - 1 - r, freqDb);    // row 0 = highest frequency
+      const li = clamp(((v - lo) / span) * 255, 0, 255) | 0, o3 = li * 3;
+      for (let sx = 0; sx < step; sx++) {
+        const o = (r * step + sx) * 4;
+        d[o] = LUT[o3]; d[o + 1] = LUT[o3 + 1]; d[o + 2] = LUT[o3 + 2]; d[o + 3] = 255;
+      }
+    }
+    SG.ctx.putImageData(SG.col, SG.pw - step, 0);
+  }
+  function drawSgram() {
+    const c = CV.sgram; if (!c || !c.w || !SG.cv) return;
+    const g = c.ctx, w = c.w, h = c.h, L = SG.L, T = SG.T, pw = w - SG.L - SG.R, ph = h - SG.T - SG.B;
+    g.clearRect(0, 0, w, h);
+    g.imageSmoothingEnabled = false;
+    g.drawImage(SG.cv, L, T, pw, ph);
+    const lr = Math.log(FMAX_VIEW / FMIN_VIEW);
+    const yf = (f) => T + (1 - Math.log(f / FMIN_VIEW) / lr) * ph;
+    g.font = FONT; g.textAlign = 'right'; g.textBaseline = 'middle';
+    for (const f of FTICKS) {
+      const yy = Math.round(yf(f)) + .5;
+      g.fillStyle = COL.axis; g.fillText(fmtHz(f), L - 6, clamp(yy, T + 5, T + ph - 5));
+      g.strokeStyle = 'rgba(255,255,255,0.06)'; g.beginPath(); g.moveTo(L, yy); g.lineTo(L + pw, yy); g.stroke();
+    }
+    // Formant band edge ticks
+    g.strokeStyle = COL.formantLine;
+    for (const f of [1500, 2000]) { const yy = Math.round(yf(f)) + .5; g.beginPath(); g.moveTo(L - 4, yy); g.lineTo(L, yy); g.stroke(); }
+    // Current harmonic ticks at right edge
+    if (A.voiced) {
+      for (let n = 1; n <= NH; n++) {
+        const f = hFreq[n]; if (!f || f < FMIN_VIEW) continue;
+        const yy = yf(f);
+        g.fillStyle = n % 2 ? COL.odd : COL.even;
+        g.fillRect(L + pw + 1, yy - 1, SG.R - 2, 2);
+      }
+    }
+    const secs = (SG.pw / SG.step) / 60;
+    g.fillStyle = COL.axis; g.textBaseline = 'top';
+    g.textAlign = 'left'; g.fillText('−' + secs.toFixed(0) + ' s', L, T + ph + 4);
+    g.textAlign = 'right'; g.fillText('now', L + pw, T + ph + 4);
+  }
+
+  // 4. Odd/even meter: gauge + running line --------------------------
+  function drawOE() {
+    const c = CV.oe; if (!c || !c.w) return;
+    const g = c.ctx, w = c.w, h = c.h;
+    g.clearRect(0, 0, w, h);
+    const vmin = -10, vmax = 30, v = A.ratioDb;
+    const gw = Math.min(150, w * 0.42), cx = gw / 2, cy = h * 0.62, r = Math.min(gw / 2 - 10, h * 0.5);
+    const ang = (x) => Math.PI + ((clamp(x, vmin, vmax) - vmin) / (vmax - vmin)) * Math.PI;
+
+    g.lineWidth = 9; g.lineCap = 'butt';
+    const SEG = 36;
+    for (let i = 0; i < SEG; i++) {
+      const a0 = Math.PI + (i / SEG) * Math.PI, a1 = Math.PI + ((i + 1) / SEG) * Math.PI + 0.01;
+      g.strokeStyle = mix('#3db8ff', '#ff8a3d', i / (SEG - 1));
+      g.globalAlpha = 0.85; g.beginPath(); g.arc(cx, cy, r, a0, a1); g.stroke();
+    }
+    g.globalAlpha = 1; g.lineWidth = 1;
+    g.font = FONT; g.fillStyle = COL.axis; g.textAlign = 'center'; g.textBaseline = 'middle';
+    for (const t of [-10, 0, 10, 20, 30]) {
+      const a = ang(t);
+      g.strokeStyle = COL.axis; g.beginPath();
+      g.moveTo(cx + Math.cos(a) * (r - 8), cy + Math.sin(a) * (r - 8));
+      g.lineTo(cx + Math.cos(a) * (r - 13), cy + Math.sin(a) * (r - 13)); g.stroke();
+      g.fillText(t, cx + Math.cos(a) * (r - 22), cy + Math.sin(a) * (r - 22));
+    }
+    if (isFinite(v)) {
+      const a = ang(v);
+      g.strokeStyle = COL.bright; g.lineWidth = 2;
+      g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + Math.cos(a) * (r + 4), cy + Math.sin(a) * (r + 4)); g.stroke();
+      g.lineWidth = 1;
+    }
+    g.fillStyle = COL.bright; g.beginPath(); g.arc(cx, cy, 3, 0, Math.PI * 2); g.fill();
+    g.font = '600 15px ui-monospace, Menlo, Consolas, monospace'; g.textBaseline = 'top';
+    g.fillText(isFinite(v) ? (v >= 0 ? '+' : '') + v.toFixed(1) + ' dB' : '—', cx, cy + 8);
+    g.font = FONT; g.fillStyle = COL.axis;
+    g.fillText(S.includeH1 ? 'odd(1,3,5…):even' : 'odd(3,5,7…):even', cx, cy + 27);
+
+    // History line
+    const hx = gw + 14, hw = w - hx - 4, ht = 6, hh = h - ht - 16;
+    if (hw < 40) return;
+    const yv = (x) => ht + ((vmax - clamp(x, vmin, vmax)) / (vmax - vmin)) * hh;
+    g.textAlign = 'left'; g.textBaseline = 'middle';
+    for (const t of [-10, 0, 10, 20, 30]) {
+      const yy = Math.round(yv(t)) + .5;
+      g.strokeStyle = t === 0 ? '#3a4652' : COL.grid;
+      g.beginPath(); g.moveTo(hx, yy); g.lineTo(hx + hw, yy); g.stroke();
+    }
+    g.fillStyle = COL.axis; g.fillText('odd = even', hx + 3, yv(0) - 7);
+    plotRing(g, oeHist, hx, hw, yv, '#ffb36b');
+    g.textBaseline = 'top'; g.textAlign = 'right';
+    g.fillText('≈' + (HIST / 60).toFixed(0) + ' s', hx + hw, ht + hh + 3);
+  }
+
+  function plotRing(g, ring, x0, w, yOf, color) {
+    g.strokeStyle = color; g.lineWidth = 1.5; g.beginPath();
+    let pen = false;
+    for (let k = 0; k < HIST; k++) {
+      const v = ring.get(k), x = x0 + (k / (HIST - 1)) * w;
+      if (!isFinite(v)) { pen = false; continue; }
+      const y = yOf(v);
+      if (pen) g.lineTo(x, y); else { g.moveTo(x, y); pen = true; }
+    }
+    g.stroke(); g.lineWidth = 1;
+  }
+
+  // 5. Register strip --------------------------------------------------
+  function drawReg() {
+    const c = CV.reg; if (!c || !c.w) return;
+    const g = c.ctx, w = c.w, h = c.h;
+    g.clearRect(0, 0, w, h);
+    const L = 6, R = 6, pw = w - L - R, bandT = 2, bandH = 20, keyT = bandT + bandH + 4, keyH = h - keyT - 15;
+    const whites = [];
+    for (let m = STRIP_LO; m <= STRIP_HI; m++) if (WHITE[mod12(m)]) whites.push(m);
+    const kw = pw / whites.length, wx = {};
+    whites.forEach((m, i) => { wx[m] = L + i * kw; });
+    const leftEdge = (m) => (WHITE[mod12(m)] ? wx[m] : wx[m - 1] + kw * 0.69);
+    const rightEdge = (m) => (WHITE[mod12(m)] ? wx[m] + kw : leftEdge(m) + kw * 0.62);
+
+    const tr = TRANSPOSE[S.instrument];
+    const wm = A.voiced ? Math.round(A.midiF) + tr : null;
+    const cur = wm != null ? registerOf(wm) : null;
+
+    g.font = '600 11px ui-sans-serif, system-ui, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    for (const rg of REGISTERS) {
+      const lo = Math.max(STRIP_LO, rg.lo), hi = Math.min(STRIP_HI, rg.hi);
+      if (lo > hi) continue;
+      const x0 = leftEdge(lo), x1 = rightEdge(hi), active = cur === rg;
+      g.globalAlpha = active ? 0.9 : 0.18; g.fillStyle = rg.color;
+      g.fillRect(x0 + 1, bandT, x1 - x0 - 2, bandH);
+      g.globalAlpha = 1;
+      g.fillStyle = active ? '#0b0d10' : rg.color;
+      if (x1 - x0 > 50) g.fillText(rg.name.toUpperCase(), (x0 + x1) / 2, bandT + bandH / 2 + 1);
+      else if (x1 - x0 > 22) g.fillText(rg.name.slice(0, 2), (x0 + x1) / 2, bandT + bandH / 2 + 1);
+    }
+
+    // White keys
+    for (const m of whites) {
+      const isCur = m === wm, rg = registerOf(m);
+      g.fillStyle = isCur ? cur.color : '#222a32';
+      g.fillRect(wx[m] + 0.5, keyT, kw - 1, keyH);
+      if (rg && !isCur) { g.fillStyle = rg.color; g.globalAlpha = 0.5; g.fillRect(wx[m] + 0.5, keyT + keyH - 3, kw - 1, 3); g.globalAlpha = 1; }
+    }
+    // Black keys
+    for (let m = STRIP_LO + 1; m <= STRIP_HI; m++) {
+      if (WHITE[mod12(m)]) continue;
+      const x = leftEdge(m), isCur = m === wm;
+      g.fillStyle = isCur ? cur.color : '#0a0d10';
+      g.fillRect(x, keyT, kw * 0.62, keyH * 0.6);
+      g.strokeStyle = '#2d3640'; g.strokeRect(x + 0.5, keyT + 0.5, kw * 0.62 - 1, keyH * 0.6 - 1);
+    }
+    // Octave labels
+    g.font = FONT; g.fillStyle = COL.axis; g.textBaseline = 'top';
+    for (const m of whites) if (mod12(m) === 0 || m === STRIP_LO) g.fillText(noteStr(m), wx[m] + kw / 2, keyT + keyH + 2);
+
+    if (wm != null && (wm < STRIP_LO || wm > STRIP_HI)) {
+      g.fillStyle = COL.warn; g.textAlign = wm < STRIP_LO ? 'left' : 'right'; g.textBaseline = 'middle';
+      g.fillText(wm < STRIP_LO ? '◀ below written E3' : 'above written C7 ▶', wm < STRIP_LO ? L + 4 : L + pw - 4, keyT + keyH * 0.8);
+    }
+  }
+
+  // 6. Spectral centroid history ---------------------------------------
+  function drawCent() {
+    const c = CV.cent; if (!c || !c.w) return;
+    const g = c.ctx, w = c.w, h = c.h;
+    g.clearRect(0, 0, w, h);
+    const L = 40, R = 4, T = 6, B = 16, pw = w - L - R, ph = h - T - B;
+    let mx = 2000;
+    for (let k = 0; k < HIST; k++) { const v = centHist.get(k); if (v > mx) mx = v; }
+    mx = Math.ceil(mx / 1000) * 1000;
+    const yv = (v) => T + (1 - clamp(v, 0, mx) / mx) * ph;
+    g.font = FONT; g.textAlign = 'right'; g.textBaseline = 'middle';
+    const stepHz = mx > 4000 ? 2000 : 1000;
+    for (let f = 0; f <= mx; f += stepHz) {
+      const yy = Math.round(yv(f)) + .5;
+      g.strokeStyle = COL.grid; g.beginPath(); g.moveTo(L, yy); g.lineTo(L + pw, yy); g.stroke();
+      g.fillStyle = COL.axis; g.fillText(fmtHz(f), L - 6, yy);
+    }
+    // Formant band reference
+    g.fillStyle = COL.formantFill; g.fillRect(L, yv(2000), pw, yv(1500) - yv(2000));
+    plotRing(g, centHist, L, pw, yv, '#c08cff');
+    const v = A.centroid;
+    g.fillStyle = COL.bright; g.textAlign = 'right'; g.textBaseline = 'top';
+    g.font = '600 13px ui-monospace, Menlo, Consolas, monospace';
+    g.fillText(isFinite(v) ? Math.round(v) + ' Hz' : '—', L + pw - 4, T + 2);
+  }
+
+  // Cents meter -----------------------------------------------------------
+  function drawCents() {
+    const c = CV.cents; if (!c || !c.w) return;
+    const g = c.ctx, w = c.w, h = c.h;
+    g.clearRect(0, 0, w, h);
+    const L = 16, R = 16, pw = w - L - R, yb = 22, xc = (ct) => L + ((ct + 50) / 100) * pw;
+    g.fillStyle = '#0b0e12'; g.fillRect(L, yb - 5, pw, 10);
+    g.fillStyle = 'rgba(158,240,200,0.22)'; g.fillRect(xc(-5), yb - 5, xc(5) - xc(-5), 10);
+    g.strokeStyle = COL.axis; g.font = FONT; g.textAlign = 'center'; g.textBaseline = 'top'; g.fillStyle = COL.axis;
+    for (let t = -50; t <= 50; t += 10) {
+      const x = Math.round(xc(t)) + .5, big = t % 50 === 0 || t === 0;
+      g.beginPath(); g.moveTo(x, yb + 6); g.lineTo(x, yb + (big ? 12 : 9)); g.stroke();
+      if (t % 25 === 0 || t === 0) g.fillText((t > 0 ? '+' : '') + t, x, yb + 13);
+    }
+    if (A.voiced) {
+      const ct = A.cents, a = Math.abs(ct), x = xc(clamp(ct, -50, 50));
+      const col = a < 5 ? COL.accent : a < 15 ? COL.warn : COL.bad;
+      g.fillStyle = col;
+      g.beginPath(); g.moveTo(x, yb + 5); g.lineTo(x - 6, yb - 7); g.lineTo(x + 6, yb - 7); g.closePath(); g.fill();
+      g.fillRect(x - 1, yb - 9, 2, 16);
+      g.textBaseline = 'bottom'; g.font = '600 12px ui-monospace, Menlo, Consolas, monospace';
+      g.fillText((ct >= 0 ? '+' : '') + ct.toFixed(1) + '¢', clamp(x, L + 20, L + pw - 20), yb - 9);
+    }
+  }
+
+  // =====================================================================
+  //  DOM readouts (throttled to ~20 Hz; text written only when it changes)
+  // =====================================================================
+  const el = {
+    noteName: $('noteName'), noteOct: $('noteOct'), badge: $('h3badge'),
+    rFreq: $('rFreq'), rCents: $('rCents'), rConcert: $('rConcert'), rWritten: $('rWritten'),
+    rReg: $('rReg'), rConf: $('rConf'), rCent: $('rCent'), rOE: $('rOE'), rH3: $('rH3'),
+    rLevel: $('rLevel'), levelBar: $('levelBar'), gateMark: $('gateMark'),
+  };
+  let lastRegColor = '';
+  function updateReadouts() {
+    const tr = TRANSPOSE[S.instrument];
+    if (A.voiced) {
+      const cm = Math.round(A.midiF), dm = S.concert ? cm : cm + tr, wm = cm + tr, rg = registerOf(wm);
+      setText(el.noteName, NAMES[mod12(dm)]);
+      setText(el.noteOct, String(Math.floor(dm / 12) - 1));
+      setText(el.rFreq, A.f0.toFixed(2) + ' Hz');
+      setText(el.rCents, (A.cents >= 0 ? '+' : '') + A.cents.toFixed(1) + ' ¢');
+      setText(el.rConcert, noteStr(cm));
+      setText(el.rWritten, noteStr(wm));
+      setText(el.rReg, rg ? rg.name : wm < STRIP_LO ? 'Below range' : '—');
+      const colr = rg ? rg.color : '';
+      if (colr !== lastRegColor) { el.rReg.style.color = colr; lastRegColor = colr; }
+      setText(el.rConf, Math.round(A.conf * 100) + ' %');
+      setText(el.rOE, isFinite(A.ratioDb) ? (A.ratioDb >= 0 ? '+' : '') + A.ratioDb.toFixed(1) + ' dB' : '—');
+      const d3 = hDb[3] - hDb[1];
+      setText(el.rH3, isFinite(d3) ? (d3 >= 0 ? '+' : '') + d3.toFixed(1) + ' dB' : '—');
+    } else {
+      for (const k of ['rFreq', 'rCents', 'rConcert', 'rWritten', 'rReg', 'rConf', 'rOE', 'rH3']) setText(el[k], '—');
+      setText(el.noteName, '–'); setText(el.noteOct, '');
+    }
+    setText(el.rCent, isFinite(A.centroid) ? Math.round(A.centroid) + ' Hz' : '—');
+    setText(el.rLevel, S.mode === 'idle' ? '—' : A.rmsDb.toFixed(0) + ' dBFS');
+    el.badge.classList.toggle('on', A.h3 && A.voiced);
+  }
+  function updateLevel() {     // transform-only update: no layout
+    const t = clamp((A.rmsDb + 90) / 90, 0, 1);
+    el.levelBar.style.transform = `scaleX(${t.toFixed(3)})`;
+    el.levelBar.classList.toggle('open', A.rmsDb > S.gateDb);
+  }
+  function placeGateMark() { el.gateMark.style.left = clamp(((S.gateDb + 90) / 90) * 100, 0, 100) + '%'; }
+
+  // =====================================================================
+  //  Main loop
+  // =====================================================================
+  function frame() {
+    requestAnimationFrame(frame);
+    if (S.mode === 'idle' || !S.analyser || S.frozen) return;
+    analyze();
+    advanceSpectrogram();
+    drawAll();
+    updateLevel();
+    if (frameNo++ % 3 === 0) updateReadouts();
+  }
+
+  // =====================================================================
+  //  PNG snapshot: composite every canvas + DOM readouts onto one image
+  // =====================================================================
+  function snapshot() {
+    const dash = $('dash'), r = dash.getBoundingClientRect(), dpr = Math.max(1, window.devicePixelRatio || 1);
+    const pad = 16, head = 54, W = r.width + pad * 2, H = r.height + pad * 2 + head;
+    const out = document.createElement('canvas');
+    out.width = Math.round(W * dpr); out.height = Math.round(H * dpr);
+    const g = out.getContext('2d'); g.scale(dpr, dpr);
+    g.fillStyle = '#0b0d10'; g.fillRect(0, 0, W, H);
+    g.fillStyle = COL.bright; g.font = '600 15px ui-sans-serif, system-ui, sans-serif'; g.textBaseline = 'top'; g.textAlign = 'left';
+    g.fillText('Clarinet Harmonic Visualizer', pad, 14);
+    g.fillStyle = COL.text; g.font = '12px ui-sans-serif, system-ui, sans-serif';
+    const src = S.mode === 'mic' ? 'Microphone' : S.mode === 'demo' ? 'Demo synth' : 'No input';
+    g.fillText(`${new Date().toLocaleString()}  ·  ${src}  ·  ${S.fftSize}-pt FFT  ·  smoothing ${S.smoothing.toFixed(2)}  ·  floor ${S.noiseFloor} dB  ·  A4 = ${S.a4} Hz`, pad, 34);
+
+    for (const p of dash.querySelectorAll('.panel')) {
+      const pr = p.getBoundingClientRect(), x = pr.left - r.left + pad, y = pr.top - r.top + pad + head;
+      g.fillStyle = '#12161b'; g.strokeStyle = '#232a32';
+      g.beginPath();
+      if (g.roundRect) g.roundRect(x, y, pr.width, pr.height, 10); else g.rect(x, y, pr.width, pr.height);
+      g.fill(); g.stroke();
+      const h2 = p.querySelector('h2'), hr = h2.getBoundingClientRect();
+      g.fillStyle = COL.text; g.font = '600 11px ui-sans-serif, system-ui, sans-serif'; g.textBaseline = 'middle';
+      g.fillText(h2.firstChild.textContent.trim().toUpperCase(), hr.left - r.left + pad, hr.top - r.top + pad + head + hr.height / 2);
+      for (const cv of p.querySelectorAll('canvas')) {
+        const cr = cv.getBoundingClientRect();
+        g.drawImage(cv, cr.left - r.left + pad, cr.top - r.top + pad + head, cr.width, cr.height);
+      }
+    }
+    for (const t of dash.querySelectorAll('[data-snap]')) {
+      if (!t.textContent) continue;
+      const tr = t.getBoundingClientRect(), cs = getComputedStyle(t);
+      g.font = `${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`; g.fillStyle = cs.color;
+      g.textBaseline = 'middle';
+      const right = cs.textAlign === 'right';
+      g.textAlign = right ? 'right' : 'left';
+      g.fillText(t.textContent, (right ? tr.right : tr.left) - r.left + pad, tr.top - r.top + pad + head + tr.height / 2);
+    }
+    if (A.h3 && A.voiced) {
+      const br = el.badge.getBoundingClientRect();
+      g.fillStyle = COL.warn; g.textAlign = 'left'; g.font = '600 11px ui-sans-serif, system-ui, sans-serif';
+      g.fillText('H3 > H1', br.left - r.left + pad + 8, br.top - r.top + pad + head + br.height / 2);
+    }
+    out.toBlob((blob) => {
+      if (!blob) return;
+      const a = document.createElement('a'), ts = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19);
+      a.href = URL.createObjectURL(blob); a.download = `clarinet-snapshot-${ts}.png`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+    }, 'image/png');
+  }
+
+  // =====================================================================
+  //  UI wiring
+  // =====================================================================
+  function showBanner(html) { $('bannerMsg').innerHTML = html; $('banner').classList.add('show'); }
+  function hideBanner() { $('banner').classList.remove('show'); }
+  function updateButtons() {
+    const mic = $('btnMic'), demo = $('btnDemo');
+    mic.textContent = S.mode === 'mic' ? 'Stop Listening' : 'Start Listening';
+    mic.classList.toggle('live', S.mode === 'mic');
+    demo.textContent = S.mode === 'demo' ? 'Stop Demo' : 'Demo Mode';
+    demo.classList.toggle('live', S.mode === 'demo');
+  }
+  function updateStatus() {
+    const st = $('status'), live = S.mode !== 'idle';
+    st.classList.toggle('live', live);
+    st.style.display = live ? '' : 'none';
+    if (!live) return;
+    const src = S.mode === 'mic' ? 'Mic' : 'Demo';
+    setText($('statusText'), `${S.frozen ? 'Frozen · ' : ''}${src} · ${(sr / 1000).toFixed(1)} kHz · ${binHz.toFixed(2)} Hz/bin · ${Math.round((S.fftSize / sr) * 1000)} ms window`);
+  }
+  function toggleFreeze() {
+    S.frozen = !S.frozen;
+    const b = $('btnFreeze'); b.classList.toggle('on', S.frozen); b.textContent = S.frozen ? 'Frozen' : 'Freeze';
+    updateStatus();
+  }
+  function bindRange(id, outId, fmt, apply) {
+    const inp = $(id), out = $(outId);
+    const f = () => { const v = parseFloat(inp.value); out.textContent = fmt(v); apply(v); };
+    inp.addEventListener('input', f); f();
+  }
+
+  $('btnMic').addEventListener('click', () => (S.mode === 'mic' ? stopAll() : startMic()));
+  $('btnDemo').addEventListener('click', () => (S.mode === 'demo' ? stopAll() : startDemo()));
+  $('btnFreeze').addEventListener('click', toggleFreeze);
+  $('btnSnap').addEventListener('click', snapshot);
+  $('btnSide').addEventListener('click', () => $('side').classList.toggle('open'));
+  $('sideClose').addEventListener('click', () => $('side').classList.remove('open'));
+  $('bannerClose').addEventListener('click', hideBanner);
+  $('bannerDemo').addEventListener('click', startDemo);
+
+  $('fftSize').addEventListener('change', (e) => { S.fftSize = parseInt(e.target.value, 10); configureAnalyser(); });
+  bindRange('smooth', 'smoothOut', (v) => v.toFixed(2), (v) => { S.smoothing = v; if (S.analyser) S.analyser.smoothingTimeConstant = v; });
+  bindRange('floor', 'floorOut', (v) => v + ' dB', (v) => { S.noiseFloor = v; if (S.frozen || S.mode === 'idle') drawAll(); });
+  bindRange('gate', 'gateOut', (v) => v + ' dBFS', (v) => { S.gateDb = v; placeGateMark(); });
+  $('inst').addEventListener('change', (e) => { S.instrument = e.target.value; updateReadouts(); drawReg(); });
+  $('concert').addEventListener('change', (e) => { S.concert = e.target.checked; updateReadouts(); });
+  $('a4').addEventListener('change', (e) => {
+    const v = parseFloat(e.target.value); if (v >= 400 && v <= 480) S.a4 = v; else e.target.value = S.a4;
+    if (A.voiced) { A.midiF = midiFromHz(A.f0); A.cents = (A.midiF - Math.round(A.midiF)) * 100; }
+    updateReadouts(); drawAll();
+  });
+  $('tmpl').addEventListener('change', (e) => { S.template = e.target.checked; drawAll(); });
+  $('incH1').addEventListener('change', (e) => { S.includeH1 = e.target.checked; oeHist.clear(); drawOE(); });
+  $('hear').addEventListener('change', (e) => {
+    S.hearDemo = e.target.checked;
+    if (S.demo && S.ctx) S.demo.mon.gain.setTargetAtTime(S.hearDemo ? 0.25 : 0, S.ctx.currentTime, 0.02);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.target.closest && e.target.closest('input, select, textarea')) return;
+    if (e.key === 'f' || e.key === 'F') toggleFreeze();
+    else if (e.key === 'p' || e.key === 'P') snapshot();
+    else if (e.key === 'Escape') $('side').classList.remove('open');
+  });
+
+  reg('harm', 'c-harm');
+  reg('spec', 'c-spec');
+  reg('sgram', 'c-sgram', sgResize);
+  reg('reg', 'c-reg');
+  reg('oe', 'c-oe');
+  reg('cent', 'c-cent');
+  reg('cents', 'c-cents');
+  placeGateMark();
+  updateButtons();
+  updateReadouts();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
